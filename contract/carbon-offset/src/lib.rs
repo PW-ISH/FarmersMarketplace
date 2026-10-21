@@ -6,6 +6,8 @@ use soroban_sdk::{
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const PENDING_ADMIN: Symbol = symbol_short!("PEND_ADM");
+const PENDING_ADMIN_EXPIRY: Symbol = symbol_short!("PEND_EXP");
+const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 // Conservative TTL bump so offset records don't get archived between writes.
 // Values are in ledgers (~5s each): ~6 days threshold, ~30 days bump.
@@ -246,6 +248,12 @@ impl CarbonOffsetContract {
             .expect("not initialized");
         admin.require_auth();
         env.storage().instance().set(&PENDING_ADMIN, &new_admin);
+        env.storage().instance().set(
+            &PENDING_ADMIN_EXPIRY,
+            &env.ledger()
+                .timestamp()
+                .saturating_add(ADMIN_PROPOSAL_TTL_SECS),
+        );
         Self::bump_instance_ttl(&env);
         env.events().publish(
             (symbol_short!("admin"), symbol_short!("proposed")),
@@ -261,9 +269,19 @@ impl CarbonOffsetContract {
             .instance()
             .get(&PENDING_ADMIN)
             .expect("no pending admin");
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_EXPIRY)
+            .unwrap_or(0);
+        assert!(
+            env.ledger().timestamp() < expires_at,
+            "admin proposal expired"
+        );
         pending.require_auth();
         env.storage().instance().set(&ADMIN, &pending);
         env.storage().instance().remove(&PENDING_ADMIN);
+        env.storage().instance().remove(&PENDING_ADMIN_EXPIRY);
         Self::bump_instance_ttl(&env);
         env.events().publish(
             (symbol_short!("admin"), symbol_short!("accepted")),

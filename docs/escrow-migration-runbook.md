@@ -21,8 +21,9 @@ use the v1 shape:
    cargo test -p soroban-escrow --lib
    ```
 
-2. Collect the order IDs to check. Keep batches small enough to review the dry
-   run output before applying a write transaction.
+2. Collect the order IDs to check and split them into batches of at most 20.
+   Preview and migrate each batch separately. Keep a manifest of the batch
+   boundaries and results so the same IDs are used in each step.
 
 3. Run the read-only preview first:
 
@@ -44,6 +45,9 @@ use the v1 shape:
    - `(order_id, false)` means the entry is missing or already v2 and will not
      be rewritten.
 
+The contract enforces the 20-ID limit on both `migrate_preview` and `migrate`.
+Use exactly the same IDs in the preview and write call for each batch.
+
 ## Execute
 
 Only run the write migration after the preview matches the intended legacy IDs.
@@ -63,11 +67,14 @@ stellar contract invoke \
 
 The function is admin-only and idempotent. It skips missing and already-v2
 records, rewrites only v1 records, extends TTL, and emits
-`("escrow", "migrated", order_id)`.
+`("escrow", "migrated", order_id)`. A successful call returns the number of
+records rewritten in that batch. If a batch fails, its transaction makes no
+partial changes; resolve the cause and retry the same batch. Previously
+completed batches remain migrated, and replaying one is safe.
 
 ## Verify
 
-Run the preview again after migration:
+Run the preview again for every batch after migration:
 
 ```bash
 stellar contract invoke \

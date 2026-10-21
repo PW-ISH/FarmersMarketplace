@@ -315,22 +315,27 @@ history is visible on every push and pull request.
 Before running an escrow schema migration, dry-run the target order IDs with the
 read-only `migrate_preview(order_ids)` contract function. The operator runbook
 is in [`docs/escrow-migration-runbook.md`](docs/escrow-migration-runbook.md).
+Preview and migration calls are limited to 20 IDs; split larger migrations into
+separately previewed, retryable batches.
 
 ### Escrow batch resource budget
 
 `contracts/escrow/src/lib.rs` keeps `MAX_BATCH_RELEASE` at `20`. The unit test
 `max_batch_deposit_and_release_resource_budget` exercises exactly 20 entries and
-fails if the Soroban SDK budget grows beyond the CI ceilings below.
+fails if the Soroban SDK budget grows beyond the CI ceilings below. The release
+case includes cooperative royalty transfers and reward-token minting;
+`release_to_stream` has a separate budget assertion with both paths active.
 
-| Function | Entries | Observed CPU | CPU ceiling | Observed memory | Memory ceiling |
+| Function | Entries | Historical baseline CPU | CPU ceiling | Historical baseline memory | Memory ceiling |
 |---|---:|---:|---:|---:|---:|
 | `batch_deposit` | 20 | 3,206,922 | 8,000,000 | 780,020 | 2,000,000 |
 | `batch_release` | 20 | 5,529,240 | 12,000,000 | 1,189,528 | 3,000,000 |
 
-Observed values were captured with Soroban SDK `22.0.0` on 2026-07-24. Exact
-resource-fee stroops are network-config dependent, so simulate against the
-target network before raising `MAX_BATCH_RELEASE` or adding more release-side
-transfers:
+The recorded measurements are historical baselines from Soroban SDK `22.0.0`
+on 2026-07-24; the test now exercises additional release-side work, so its live
+assertions (not those baseline values) are authoritative. Exact resource-fee
+stroops are network-config dependent, so simulate against the target network
+before raising `MAX_BATCH_RELEASE` or adding more release-side transfers:
 
 ```bash
 stellar contract invoke \
@@ -589,15 +594,6 @@ For security vulnerabilities, follow the process in [SECURITY.md](./SECURITY.md)
 - #1313: Legacy `grant_role` lets anyone claim `Platform` before `initialize`, and `revoke_role` can lock out all admins
 <!-- handsoff-issue-1306 -->
 - #1306: Escrow snapshots are non-durable and can be spammed
-
-<!-- handsoff-issue-1307 -->
-- #1307: Payment-stream `withdraw`/`cancel`/`top_up` take a caller-supplied token address, which can drain other assets
-
-<!-- handsoff-issue-1308 -->
-- #1308: Streams created by `release_to_stream` can never be withdrawn or cancelled
-
-<!-- handsoff-issue-1309 -->
-- #1309: Payment-stream storage entries are never TTL-extended
 
 <!-- handsoff-issue-1382 -->
 - #1382: Align `api/client.js` with real backend routes: about a dozen methods call endpoints that don't exist

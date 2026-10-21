@@ -45,6 +45,7 @@ use soroban_sdk::{
 /// Maximum number of entries accepted by `batch_credit` in a single call —
 /// keeps the transaction under Stellar's operation limit.
 const MAX_BATCH_CREDIT: u32 = 20;
+const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -72,6 +73,12 @@ pub enum EarningsError {
     /// the creator's farmer_amount and the platform's fee_amount into the
     /// same DataKey::Balance entry.
     CreatorIsPlatform = 8,
+    /// `init()` has already assigned the initial platform.
+    AlreadyInitialized = 9,
+    /// There is no pending platform transfer.
+    NoPendingAdmin = 10,
+    /// The pending platform transfer has expired.
+    AdminProposalExpired = 11,
 }
 
 // ---------------------------------------------------------------------------
@@ -93,6 +100,10 @@ pub enum DataKey {
     AuthorizedCaller,
     /// Flag indicating the contract has been initialized.
     Initialized,
+    /// Proposed platform address awaiting acceptance.
+    PendingPlatform,
+    /// Expiration timestamp for the pending platform proposal.
+    PlatformProposalExpiry,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,22 +129,60 @@ impl CreatorEarningsContract {
             / 10_000
     }
 
-    /// One-time initialisation: register the platform fee recipient.
-    /// After first call, only the currently-configured platform address can call this to update itself.
+    /// One-time initialization of the platform administrator.
     pub fn init(env: Env, platform: Address) -> Result<(), EarningsError> {
-        let initialized = env.storage().instance().has(&DataKey::Initialized);
-
-        if initialized {
-            // Contract already initialized; only the current platform can update the address.
-            let current_platform: Address = env.storage()
-                .instance()
-                .get(&DataKey::Platform)
-                .expect("Platform not found when Initialized flag is set");
-            current_platform.require_auth();
+        if env.storage().instance().has(&DataKey::Initialized) {
+            return Err(EarningsError::AlreadyInitialized);
         }
-        // First-time init or platform updating its own address: proceed.
+        platform.require_auth();
         env.storage().instance().set(&DataKey::Platform, &platform);
         env.storage().instance().set(&DataKey::Initialized, &true);
+        Ok(())
+    }
+
+    /// Current platform proposes a replacement platform address.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), EarningsError> {
+        let platform: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Platform)
+            .ok_or(EarningsError::NotInitialised)?;
+        platform.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingPlatform, &new_admin);
+        env.storage().instance().set(
+            &DataKey::PlatformProposalExpiry,
+            &env.ledger()
+                .timestamp()
+                .saturating_add(ADMIN_PROPOSAL_TTL_SECS),
+        );
+        env.events().publish(("admin", "proposed"), new_admin);
+        Ok(())
+    }
+
+    /// Proposed platform accepts the transfer before its seven-day expiry.
+    pub fn accept_admin(env: Env) -> Result<(), EarningsError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingPlatform)
+            .ok_or(EarningsError::NoPendingAdmin)?;
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PlatformProposalExpiry)
+            .unwrap_or(0);
+        if env.ledger().timestamp() >= expires_at {
+            return Err(EarningsError::AdminProposalExpired);
+        }
+        pending.require_auth();
+        env.storage().instance().set(&DataKey::Platform, &pending);
+        env.storage().instance().remove(&DataKey::PendingPlatform);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PlatformProposalExpiry);
+        env.events().publish(("admin", "accepted"), pending);
         Ok(())
     }
 
@@ -1156,7 +1205,7 @@ mod test {
         }
     // ── #961: init() access control ──────────────────────────────────────────
 
-    /// #961: Unauthenticated address cannot call init() after first initialization.
+    /// Re-initialization is rejected; transfers use the two-step proposal.
     #[test]
     fn init_second_call_from_different_address_fails() {
         let env = Env::default();
@@ -1167,15 +1216,11 @@ mod test {
 
         CreatorEarningsContract::init(env.clone(), platform1.clone()).unwrap();
 
-        // Try to reinit with a different address—should fail because platform2 is not authenticated.
-        env.mock_all_auths_allowing_non_root_invoker();
         let result = CreatorEarningsContract::init(env.clone(), platform2.clone());
-        // This should fail with an auth error in the actual contract.
-        // For now, the test ensures init() returns a Result.
-        assert!(result.is_ok() || result.is_err());
+        assert_eq!(result, Err(EarningsError::AlreadyInitialized));
     }
 
-    /// #961: Platform address can update itself.
+    /// The current platform transfers control through proposal and acceptance.
     #[test]
     fn init_platform_can_update_its_own_address() {
         let env = Env::default();
@@ -1186,10 +1231,12 @@ mod test {
 
         CreatorEarningsContract::init(env.clone(), platform1.clone()).unwrap();
 
-        // Platform1 re-initializes with a new address (itself, in effect).
-        // This should succeed because platform1 is authenticated.
-        let result = CreatorEarningsContract::init(env.clone(), platform2.clone());
-        assert!(result.is_ok());
+        CreatorEarningsContract::propose_admin(env.clone(), platform2.clone()).unwrap();
+        CreatorEarningsContract::accept_admin(env.clone()).unwrap();
+        assert_eq!(
+            CreatorEarningsContract::platform(env).unwrap(),
+            platform2
+        );
     }
 
     // ── #962: platform() getter ──────────────────────────────────────────────
