@@ -601,6 +601,11 @@ For security vulnerabilities, follow the process in [SECURITY.md](./SECURITY.md)
 <!-- handsoff-issue-1382 -->
 - #1382: Align `api/client.js` with real backend routes: about a dozen methods call endpoints that don't exist
 
+<!-- handsoff-issue-1524 -->
+- #1524: CT-05: Multisig payload should bind the action and network, not just `(contract, order_id)`
+
+<!-- handsoff-issue-1540 -->
+- #1540: CT-21: Evidence submission — validate party, window and storage layout
 <!-- handsoff-issue-1525 -->
 - #1525: CT-06: `creator-earnings::claim` lets the caller choose any token, but balances aren't tracked per token
 
