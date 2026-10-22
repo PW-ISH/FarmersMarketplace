@@ -1,0 +1,17 @@
+# CT-30: arguments for contracts/scripts/deploy.sh mainnet.
+# "REPLACE_WITH_MAINNET_ADDRESS" is replaced with the deploying account's public key.
+
+[escrow]
+admin = "REPLACE_WITH_MAINNET_ADDRESS"
+fee_bps = 250
+fee_destination = "REPLACE_WITH_MAINNET_ADDRESS"
+
+[creator-earnings]
+platform = "REPLACE_WITH_MAINNET_ADDRESS"
+
+[reward-token]
+admin = "REPLACE_WITH_MAINNET_ADDRESS"
+decimal = 7
+name = "Farmers Reward Token"
+symbol = "FRT"
+max_supply = 1000000000000000
