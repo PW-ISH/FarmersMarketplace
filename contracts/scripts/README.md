@@ -6,3 +6,14 @@ Run these from the repository root before deploying or in CI.
 - `NETWORK=testnet DATABASE_URL=... bash contracts/scripts/check-wasm-hashes.sh` rebuilds every contract, hashes its WASM, and fails when it differs from the hash registered in `contracts_registry`.
 
 The hash check requires the Rust WASM target, `cargo`, `psql`, and `shasum`. Registry rows must have a `wasm_hash` recorded at deployment time; it deliberately fails on missing hashes rather than treating an unverified deployment as valid.
+
+## deploy.sh (CT-30)
+
+`STELLAR_SECRET_KEY=S... contracts/scripts/deploy.sh <testnet|futurenet|mainnet>`
+
+Builds, optimises, uploads and deploys escrow, creator-earnings and reward-token,
+initialises them from `contracts/deploy.<network>.toml`, wires escrow as the
+reward-token minter and creator-earnings authorised caller, and writes
+`deployments/<network>.json`. Unchanged WASM hashes are skipped. The backend
+reads contract IDs from that file when the `*_CONTRACT_ID` env vars are unset.
+`contract/cli.sh` and `contract/test-futurenet.sh` are superseded by this script.
