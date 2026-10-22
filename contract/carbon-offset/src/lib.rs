@@ -1,11 +1,13 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
 };
 
 const ADMIN: Symbol = symbol_short!("ADMIN");
 const PENDING_ADMIN: Symbol = symbol_short!("PEND_ADM");
+const PENDING_ADMIN_EXPIRY: Symbol = symbol_short!("PEND_EXP");
+const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
 
 // Conservative TTL bump so offset records don't get archived between writes.
 // Values are in ledgers (~5s each): ~6 days threshold, ~30 days bump.
@@ -17,6 +19,30 @@ const BUMP_AMOUNT: u32 = 500_000;
 // the config being archived on a quiet deployment.
 const TTL_MIN: u32 = 100_000;
 const TTL_MAX: u32 = 500_000;
+
+/// Typed errors for the carbon-offset contract. Codes are stable and must not
+/// be renumbered; clients map them to user-facing messages.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum CarbonError {
+    /// 1 — `initialize` was already called.
+    AlreadyInitialized = 1,
+    /// 2 — contract has not been initialized yet.
+    NotInitialized = 2,
+    /// 3 — `kg_co2` must be greater than zero.
+    InvalidOffsetAmount = 3,
+    /// 4 — an offset is already recorded for this order.
+    OffsetAlreadyRecorded = 4,
+    /// 5 — no verifier approval exists for this order.
+    VerifierApprovalRequired = 5,
+    /// 6 — verifier approval does not match the requested offset.
+    VerifierApprovalMismatch = 6,
+    /// 7 — cannot amend a voided offset.
+    CannotAmendVoided = 7,
+    /// 8 — no active offset record found for this order.
+    OffsetNotFound = 8,
+}
 
 #[derive(Clone)]
 #[contracttype]
@@ -71,25 +97,39 @@ impl CarbonOffsetContract {
             .extend_ttl(BUMP_THRESHOLD, BUMP_AMOUNT);
     }
 
-    fn require_positive_offset(kg_co2: u64) {
+    fn require_positive_offset(kg_co2: u64) -> Result<(), CarbonError> {
         if kg_co2 == 0 {
-            panic!("kg_co2 must be positive");
+            return Err(CarbonError::InvalidOffsetAmount);
         }
+        Ok(())
+    }
+
+    fn load_admin(env: &Env) -> Result<Address, CarbonError> {
+        env.storage()
+            .instance()
+            .get(&ADMIN)
+            .ok_or(CarbonError::NotInitialized)
     }
 
     /// One-time setup: sets the platform admin address allowed to call `record_offset`.
-    pub fn initialize(env: Env, admin: Address) {
+    pub fn initialize(env: Env, admin: Address) -> Result<(), CarbonError> {
         admin.require_auth();
         if env.storage().instance().has(&ADMIN) {
-            panic!("already initialized");
+            return Err(CarbonError::AlreadyInitialized);
         }
         env.storage().instance().set(&ADMIN, &admin);
         Self::bump_instance_ttl(&env);
+        Ok(())
     }
 
     /// A verifier must authorize the exact offset amount before the platform can record it.
-    pub fn authorize_offset(env: Env, order_id: u64, kg_co2: u64, verifier: Address) {
-        Self::require_positive_offset(kg_co2);
+    pub fn authorize_offset(
+        env: Env,
+        order_id: u64,
+        kg_co2: u64,
+        verifier: Address,
+    ) -> Result<(), CarbonError> {
+        Self::require_positive_offset(kg_co2)?;
         verifier.require_auth();
         let key = DataKey::Verification(order_id);
         env.storage().persistent().set(
@@ -107,20 +147,26 @@ impl CarbonOffsetContract {
             (order_id, kg_co2, verifier),
         );
         bump_instance(&env);
+        Ok(())
     }
 
     /// Record a verified carbon offset for `order_id`. Callable only by the platform admin.
     /// Emits ("carbon", "offset", order_id, kg_co2).
-    pub fn record_offset(env: Env, order_id: u64, kg_co2: u64, verifier: Address) {
-        Self::require_positive_offset(kg_co2);
-        let admin: Address = env.storage().instance().get(&ADMIN).expect("not initialized");
+    pub fn record_offset(
+        env: Env,
+        order_id: u64,
+        kg_co2: u64,
+        verifier: Address,
+    ) -> Result<(), CarbonError> {
+        Self::require_positive_offset(kg_co2)?;
+        let admin = Self::load_admin(&env)?;
         admin.require_auth();
 
         let key = DataKey::Offset(order_id);
         let void_key = DataKey::Voided(order_id);
         let was_voided: bool = env.storage().persistent().get(&void_key).unwrap_or(false);
         if env.storage().persistent().has(&key) && !was_voided {
-            panic!("offset already recorded for this order");
+            return Err(CarbonError::OffsetAlreadyRecorded);
         }
 
         let verification_key = DataKey::Verification(order_id);
@@ -128,9 +174,9 @@ impl CarbonOffsetContract {
             .storage()
             .persistent()
             .get(&verification_key)
-            .expect("verifier approval required");
+            .ok_or(CarbonError::VerifierApprovalRequired)?;
         if approval.kg_co2 != kg_co2 || approval.verifier != verifier {
-            panic!("verifier approval does not match offset");
+            return Err(CarbonError::VerifierApprovalMismatch);
         }
 
         let previous: Option<CarbonOffset> = if was_voided {
@@ -172,6 +218,7 @@ impl CarbonOffsetContract {
             (symbol_short!("carbon"), symbol_short!("offset")),
             (order_id, kg_co2),
         );
+        Ok(())
     }
 
     /// Public, read-only lookup of an order's carbon offset record.
@@ -188,9 +235,14 @@ impl CarbonOffsetContract {
     }
 
     /// Amend an incorrect record. The verifier must authorize the corrected amount.
-    pub fn amend_offset(env: Env, order_id: u64, kg_co2: u64, verifier: Address) {
-        Self::require_positive_offset(kg_co2);
-        let admin: Address = env.storage().instance().get(&ADMIN).expect("not initialized");
+    pub fn amend_offset(
+        env: Env,
+        order_id: u64,
+        kg_co2: u64,
+        verifier: Address,
+    ) -> Result<(), CarbonError> {
+        Self::require_positive_offset(kg_co2)?;
+        let admin = Self::load_admin(&env)?;
         admin.require_auth();
         verifier.require_auth();
         if env
@@ -199,14 +251,14 @@ impl CarbonOffsetContract {
             .get::<DataKey, bool>(&DataKey::Voided(order_id))
             .unwrap_or(false)
         {
-            panic!("cannot amend a voided offset");
+            return Err(CarbonError::CannotAmendVoided);
         }
         let key = DataKey::Offset(order_id);
         let mut record: CarbonOffset = env
             .storage()
             .persistent()
             .get(&key)
-            .expect("offset not found");
+            .ok_or(CarbonError::OffsetNotFound)?;
         let previous_kg_co2 = record.kg_co2;
         record.kg_co2 = kg_co2;
         record.verifier = verifier.clone();
@@ -220,11 +272,12 @@ impl CarbonOffsetContract {
             (symbol_short!("carbon"), symbol_short!("amended")),
             (order_id, previous_kg_co2, kg_co2, verifier),
         );
+        Ok(())
     }
 
     /// Void an incorrect record so it can be reissued after a new verifier approval.
-    pub fn void_offset(env: Env, order_id: u64) {
-        let admin: Address = env.storage().instance().get(&ADMIN).expect("not initialized");
+    pub fn void_offset(env: Env, order_id: u64) -> Result<(), CarbonError> {
+        let admin = Self::load_admin(&env)?;
         admin.require_auth();
         let key = DataKey::Offset(order_id);
         if !env.storage().persistent().has(&key)
@@ -234,9 +287,13 @@ impl CarbonOffsetContract {
                 .get::<DataKey, bool>(&DataKey::Voided(order_id))
                 .unwrap_or(false)
         {
-            panic!("active offset not found");
+            return Err(CarbonError::OffsetNotFound);
         }
-        let record: CarbonOffset = env.storage().persistent().get(&key).unwrap();
+        let record: CarbonOffset = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(CarbonError::OffsetNotFound)?;
         let void_key = DataKey::Voided(order_id);
         env.storage().persistent().set(&void_key, &true);
         env.storage()
@@ -258,6 +315,12 @@ impl CarbonOffsetContract {
             .expect("not initialized");
         admin.require_auth();
         env.storage().instance().set(&PENDING_ADMIN, &new_admin);
+        env.storage().instance().set(
+            &PENDING_ADMIN_EXPIRY,
+            &env.ledger()
+                .timestamp()
+                .saturating_add(ADMIN_PROPOSAL_TTL_SECS),
+        );
         Self::bump_instance_ttl(&env);
         env.events().publish(
             (symbol_short!("admin"), symbol_short!("proposed")),
@@ -273,13 +336,24 @@ impl CarbonOffsetContract {
             .instance()
             .get(&PENDING_ADMIN)
             .expect("no pending admin");
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_EXPIRY)
+            .unwrap_or(0);
+        assert!(
+            env.ledger().timestamp() < expires_at,
+            "admin proposal expired"
+        );
         pending.require_auth();
         env.storage().instance().set(&ADMIN, &pending);
         env.storage().instance().remove(&PENDING_ADMIN);
+        env.storage().instance().remove(&PENDING_ADMIN_EXPIRY);
         Self::bump_instance_ttl(&env);
         env.events().publish(
             (symbol_short!("admin"), symbol_short!("accepted")),
             pending,
+            (order_id, record.kg_co2),
         );
         bump_instance(&env);
     }
@@ -485,5 +559,6 @@ mod test {
         let record = client.get_offset(&7);
         assert_eq!(record.order_id, 7);
         assert_eq!(record.kg_co2, 50);
+        Ok(())
     }
 }

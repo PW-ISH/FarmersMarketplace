@@ -315,22 +315,27 @@ history is visible on every push and pull request.
 Before running an escrow schema migration, dry-run the target order IDs with the
 read-only `migrate_preview(order_ids)` contract function. The operator runbook
 is in [`docs/escrow-migration-runbook.md`](docs/escrow-migration-runbook.md).
+Preview and migration calls are limited to 20 IDs; split larger migrations into
+separately previewed, retryable batches.
 
 ### Escrow batch resource budget
 
 `contracts/escrow/src/lib.rs` keeps `MAX_BATCH_RELEASE` at `20`. The unit test
 `max_batch_deposit_and_release_resource_budget` exercises exactly 20 entries and
-fails if the Soroban SDK budget grows beyond the CI ceilings below.
+fails if the Soroban SDK budget grows beyond the CI ceilings below. The release
+case includes cooperative royalty transfers and reward-token minting;
+`release_to_stream` has a separate budget assertion with both paths active.
 
-| Function | Entries | Observed CPU | CPU ceiling | Observed memory | Memory ceiling |
+| Function | Entries | Historical baseline CPU | CPU ceiling | Historical baseline memory | Memory ceiling |
 |---|---:|---:|---:|---:|---:|
 | `batch_deposit` | 20 | 3,206,922 | 8,000,000 | 780,020 | 2,000,000 |
 | `batch_release` | 20 | 5,529,240 | 12,000,000 | 1,189,528 | 3,000,000 |
 
-Observed values were captured with Soroban SDK `22.0.0` on 2026-07-24. Exact
-resource-fee stroops are network-config dependent, so simulate against the
-target network before raising `MAX_BATCH_RELEASE` or adding more release-side
-transfers:
+The recorded measurements are historical baselines from Soroban SDK `22.0.0`
+on 2026-07-24; the test now exercises additional release-side work, so its live
+assertions (not those baseline values) are authoritative. Exact resource-fee
+stroops are network-config dependent, so simulate against the target network
+before raising `MAX_BATCH_RELEASE` or adding more release-side transfers:
 
 ```bash
 stellar contract invoke \
@@ -501,13 +506,12 @@ These codes are stable on-chain ABI values. Never reuse a code, even after remov
 | 25 | `InvalidRoyalty` | Cooperative royalty exceeds 10 000 bps (100%) |
 | 26 | `EvidenceLimitReached` | Party already submitted the maximum number of evidence hashes |
 | 27 | `NotDisputed` | Operation requires the escrow to be disputed |
-| 28 | `NotInitialized` | Admin not configured; `initialize` has not been called |
+| 28 | `NotInitialized` | Admin or settlement configuration is missing; call `initialize` first |
+| 29 | `InvalidParties` | Buyer equals farmer, or the cooperative address equals either party |
+| 30 | `InvalidCoopConfig` | Cooperative threshold or member configuration is invalid |
+| 31 | `NotInDispute` | `resolve_dispute` called on an escrow that is not disputed |
 
-Next available code: **29**. See the `NEXT_CODE` comment in `contracts/escrow/src/lib.rs` for the authoritative value.
-| 23 | `NotInitialized` | A stored value settlement depends on (platform fee, fee destination, admin) is missing because `initialize` was never called |
-| 24 | `NotInDispute` | `resolve_dispute` called on an escrow that is not in the `Disputed` state |
-
-Next available code: **25**. See the `NEXT_CODE` comment in `contracts/escrow/src/lib.rs` for the authoritative value.
+Next available code: **32**. See the `NEXT_CODE` comment in `contracts/escrow/src/lib.rs` for the authoritative value.
 
 ### Build & Test
 
@@ -590,14 +594,23 @@ For security vulnerabilities, follow the process in [SECURITY.md](./SECURITY.md)
 <!-- handsoff-issue-1306 -->
 - #1306: Escrow snapshots are non-durable and can be spammed
 
-<!-- handsoff-issue-1307 -->
-- #1307: Payment-stream `withdraw`/`cancel`/`top_up` take a caller-supplied token address, which can drain other assets
-
-<!-- handsoff-issue-1308 -->
-- #1308: Streams created by `release_to_stream` can never be withdrawn or cancelled
-
-<!-- handsoff-issue-1309 -->
-- #1309: Payment-stream storage entries are never TTL-extended
-
 <!-- handsoff-issue-1382 -->
 - #1382: Align `api/client.js` with real backend routes: about a dozen methods call endpoints that don't exist
+
+<!-- handsoff-issue-1524 -->
+- #1524: CT-05: Multisig payload should bind the action and network, not just `(contract, order_id)`
+
+<!-- handsoff-issue-1540 -->
+- #1540: CT-21: Evidence submission — validate party, window and storage layout
+<!-- handsoff-issue-1525 -->
+- #1525: CT-06: `creator-earnings::claim` lets the caller choose any token, but balances aren't tracked per token
+
+<!-- handsoff-issue-1528 -->
+- #1528: CT-09: Buyer/farmer escrow index stops growing at `MAX_INDEX_ENTRIES` (1,000) — define the behaviour
+<!-- handsoff-issue-1522 -->
+- #1522: CT-03: Truncated and duplicated function signatures: `resolve_dispute`, `set_coop`, `multisig_release`
+<!-- handsoff-issue-1538 -->
+- #1538: CT-19: Rounding policy tests for fees, royalties and rewards
+
+<!-- handsoff-issue-1539 -->
+- #1539: CT-20: Auto-release and timeout refund: define precedence and test the boundaries

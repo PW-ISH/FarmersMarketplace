@@ -253,6 +253,8 @@ jobs:
   contracts:
     name: Contracts (fmt, clippy, test, wasm)
     # Runs on every PR and push to main so non-compiling contract code can't land (#1286).
+    # The legacy `contract/` crate is deprecated (see ADR 0002) and is intentionally
+    # excluded from this matrix; only the actively developed `contracts/` workspace is built.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

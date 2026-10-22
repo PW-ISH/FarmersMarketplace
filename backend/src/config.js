@@ -1,4 +1,6 @@
 require('dotenv').config();
+// CT-30: contract IDs from deployments/<network>.json when env vars are absent
+require('./utils/deploymentRegistry').applyDeploymentFallback(process.env);
 const { z, ZodError } = require('zod');
 
 const EnvSchema = z.object({

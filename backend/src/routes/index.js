@@ -306,6 +306,7 @@ function addDeprecationHeaders(req, res, next) {
 // ============================================================================
 
 router.get('/sitemap.xml', require('./sitemap'));
+router.use('/seo', require('./seo'));
 router.get('/robots.txt', (req, res) => {
   const host = process.env.BACKEND_URL || `${req.protocol}://${req.get('host')}`;
   res.type('text/plain').send(
@@ -408,6 +409,7 @@ registerRoute('/', '/products', require('./products'));
 registerRoute('/', '/orders', require('./orderBudgetGuard'));
 registerRoute('/', '/orders', require('./orderReceipt'));
 registerRoute('/', '/orders', require('./orders'));
+registerRoute('/', '/rewards', require('./rewards'));
 registerRoute('/', '/orders/:id/return', require('./returns'));
 registerRoute('/', '/disputes', require('./disputes'));
 registerRoute('/', '/waitlist', require('./waitlist'));
