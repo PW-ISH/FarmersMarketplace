@@ -11,6 +11,8 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
 
+const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 #[contracttype]
 #[derive(Clone)]
 pub struct TokenMetadata {
@@ -28,6 +30,7 @@ pub enum DataKey {
     Metadata,
     TotalSupply,
     PendingAdmin,
+    AdminProposalExpiry,
     /// Vesting lock entry: maps (address, mint_ledger) → VestingEntry (#693).
     Vesting(Address, u32),
     /// On-chain index of active vesting entries for an address. Source of truth
@@ -804,14 +807,34 @@ impl RewardToken {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.storage().instance().set(
+            &DataKey::AdminProposalExpiry,
+            &env.ledger()
+                .timestamp()
+                .saturating_add(ADMIN_PROPOSAL_TTL_SECS),
+        );
+        env.events().publish(("admin", "proposed"), new_admin);
     }
 
     pub fn accept_admin(env: Env) {
         let pending: Address = env.storage().instance().get(&DataKey::PendingAdmin)
             .expect("no pending admin");
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminProposalExpiry)
+            .unwrap_or(0);
+        assert!(
+            env.ledger().timestamp() < expires_at,
+            "admin proposal expired"
+        );
         pending.require_auth();
         env.storage().instance().set(&DataKey::Admin, &pending);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AdminProposalExpiry);
+        env.events().publish(("admin", "accepted"), pending);
     }
 }
 

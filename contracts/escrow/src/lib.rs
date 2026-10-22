@@ -39,6 +39,12 @@ const MAX_BATCH_RELEASE: u32 = 20;
 /// Maximum number of entries accepted by `batch_deposit`. (#1292)
 const MAX_BATCH_DEPOSIT: u32 = 20;
 
+/// Maximum number of records to preview or migrate in one call.
+const MAX_BATCH_MIGRATION: u32 = 20;
+
+/// Pending admin proposals expire after seven days.
+const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// Maximum number of cooperative signer slots to prevent unbounded loop cost
 /// in multisig_release. Chosen conservatively below Soroban's per-transaction
 /// instruction budget to ensure signature verification remains efficient. (#979)
@@ -92,6 +98,11 @@ pub enum EscrowError {
     /// Caller is not the platform admin or does not hold the required role. (#837)
     NotAdmin = 15,
     /// Deposit amount is below the configured minimum (dust guard). (#857)
+    BelowMinDeposit        = 16,
+    /// A batch release, deposit, preview, or migration exceeded its configured size.
+    BatchTooLarge          = 17,
+    BelowMinDeposit = 16,
+    /// `batch_release` was called with more than `MAX_BATCH_RELEASE` order IDs. (#856)
     BelowMinDeposit = 16,
     /// `batch_release` / `batch_deposit` was called with more than
     /// `MAX_BATCH_RELEASE` / `MAX_BATCH_DEPOSIT` entries. (#856, #1292)
@@ -119,6 +130,10 @@ pub enum EscrowError {
     /// Admin or settlement configuration has not been set; call `initialize` first. (#1291, #1301)
     NotInitialized = 28,
     /// Buyer equals farmer, or the cooperative address equals either party. (#1290)
+    InvalidParties         = 23,
+    TooManyCoopSigners = 22,
+    /// An admin transfer proposal has expired.
+    AdminProposalExpired = 29,
     InvalidParties = 29,
     /// Coop threshold is 0, exceeds member count, or members contain duplicates. (#1296)
     InvalidCoopConfig = 30,
@@ -186,6 +201,8 @@ pub enum DataKey {
     BuyerEscrows(Address),
     /// Index of order_ids for a given farmer address. (#876)
     FarmerEscrows(Address),
+    /// Expiration timestamp for the current pending admin proposal.
+    AdminProposalExpiry,
 }
 
 /// Full escrow record. `token` stores the SAC address used for this escrow (#683).
@@ -557,9 +574,8 @@ impl EscrowContract {
     /// is written or tokens move; if any entry is invalid the entire batch is
     /// rejected. (#1292)
     ///
-    /// `buyer.require_auth()` is called for every entry, so a batch mixing
-    /// several buyers needs all of their signatures on one transaction. In
-    /// practice a batch should contain a single buyer.
+    /// All entries must belong to one buyer, which authorizes the complete
+    /// payment before any entry is written or tokens are transferred.
     pub fn batch_deposit(
         env: Env,
         entries: Vec<(u64, Address, Address, Address, i128, u64)>,
@@ -568,20 +584,29 @@ impl EscrowContract {
             return Err(EscrowError::BatchTooLarge);
         }
 
-        // Validate all entries first (fail-fast before touching state).
+        // Validate and authorize every entry before writing state or moving tokens.
         let mut seen: Vec<u64> = Vec::new(&env);
+        let mut batch_buyer: Option<Address> = None;
         for entry in entries.iter() {
-            let (order_id, _buyer, _farmer, _token, amount, timeout_unix) = entry;
-            if seen.contains(&order_id) {
-            let (order_id, buyer, farmer, _token, amount, _timeout) = entry;
+            let (order_id, buyer, farmer, _token, amount, timeout_unix) = entry;
+            if seen.contains(&order_id)
+                || env.storage().persistent().has(&DataKey::Escrow(order_id))
+            {
+                return Err(EscrowError::AlreadyExists);
+            }
+            if let Some(expected_buyer) = &batch_buyer {
+                if *expected_buyer != buyer {
+                    return Err(EscrowError::InvalidParties);
+                }
+            } else {
+                batch_buyer = Some(buyer.clone());
+            }
             if amount <= 0 {
                 return Err(EscrowError::InvalidAmount);
             }
             Self::validate_parties(&buyer, &farmer, &None, 0)?;
-            if env.storage().persistent().has(&DataKey::Escrow(order_id)) {
-                return Err(EscrowError::AlreadyExists);
-            }
             Self::validate_deposit(&env, order_id, amount, timeout_unix, 0)?;
+            buyer.require_auth();
             seen.push_back(order_id);
         }
 
@@ -594,17 +619,6 @@ impl EscrowContract {
 
         for entry in entries.iter() {
             let (order_id, buyer, farmer, token, amount, timeout_unix) = entry;
-            buyer.require_auth();
-
-            let escrow = Escrow {
-                buyer: buyer.clone(),
-                farmer,
-            let now = env.ledger().timestamp();
-            let auto_release_days: u64 = env
-                .storage()
-                .instance()
-                .get(&DataKey::AutoReleaseDays)
-                .unwrap_or(Self::DEFAULT_AUTO_RELEASE_DAYS);
             let escrow = Escrow {
                 buyer: buyer.clone(),
                 farmer: farmer.clone(),
@@ -631,16 +645,9 @@ impl EscrowContract {
                 .persistent()
                 .extend_ttl(&DataKey::Token(order_id), TTL_MIN, TTL_MAX);
 
-            // Effects before interactions: record is written before the transfer.
             let token_client = token::Client::new(&env, &token);
             token_client.transfer(&buyer, &env.current_contract_address(), &amount);
             Self::index_escrow(&env, &buyer, &farmer, order_id);
-
-            token::Client::new(&env, &token).transfer(
-            &buyer,
-            &env.current_contract_address(),
-            &amount,
-        );
         }
         Ok(())
     }
@@ -889,25 +896,6 @@ impl EscrowContract {
         if !matches!(mint_result, Ok(Ok(()))) {
             env.events()
                 .publish(("escrow", "mint_failed", order_id), ());
-        if let Some(reward_token_address) =
-            env.storage().instance().get(&DataKey::RewardTokenContract)
-        {
-            // Use try_invoke to call reward token mint - if it fails, emit event but don't abort release
-            let mint_args = soroban_sdk::vec![
-                &env,
-                escrow.buyer.clone().into_val(&env),
-                reward_amount.into_val(&env),
-            ];
-            let mint_result = env.try_invoke_contract::<(), EscrowError>(
-                &reward_token_address,
-                &symbol_short!("mint"),
-                mint_args,
-            );
-            if !matches!(mint_result, Ok(Ok(()))) {
-                // Mint failed - emit event but release proceeds
-                env.events()
-                    .publish(("escrow", "mint_failed", order_id), ());
-            }
         }
     }
 
@@ -1084,23 +1072,46 @@ impl EscrowContract {
         Ok(stream_id)
     }
 
-    /// Rotate the admin to a new address. Admin-only; can only be called after
-    /// initialize() has been called (i.e. an admin must already exist). Prevents
-    /// front-running attacks during bootstrap. (#954)
-    pub fn set_admin(env: Env, admin: Address) -> Result<(), EscrowError> {
-        let existing_admin: AdminTransfer = env
+    /// Withdraw available streamed funds to the stream recipient.
+    /// The token is resolved from the originating escrow rather than supplied
+    /// by the caller, preventing cross-token withdrawals.
+    pub fn withdraw_stream(
+        env: Env,
+        stream_id: u64,
+        recipient: Address,
+    ) -> Result<i128, EscrowError> {
+        let escrow: Escrow = env
             .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(EscrowError::Unauthorized)?;
-        existing_admin.current_admin.require_auth();
+            .persistent()
+            .get(&DataKey::Escrow(stream_id))
+            .ok_or(EscrowError::NotFound)?;
+        let key = stream::StreamKey::Stream(stream_id);
+        if !env.storage().persistent().has(&key) {
+            return Err(EscrowError::NotFound);
+        }
+        Ok(stream::withdraw(
+            &env,
+            stream_id,
+            &escrow.token,
+            &recipient,
+        ))
+    }
 
-        let transfer = AdminTransfer {
-            current_admin: admin,
-            pending_admin: None,
-        };
-        env.storage().instance().set(&DataKey::Admin, &transfer);
-        Ok(())
+    /// Permissionless checkpoint that advances accrual and refreshes stream TTL.
+    pub fn checkpoint_stream(env: Env, stream_id: u64) -> Result<i128, EscrowError> {
+        let key = stream::StreamKey::Stream(stream_id);
+        let payment_stream: stream::PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::NotFound)?;
+        let payment_stream = stream::checkpoint(payment_stream, env.ledger().timestamp());
+        let accrued = payment_stream.accrued_at_checkpoint;
+        env.storage().persistent().set(&key, &payment_stream);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, TTL_MIN, TTL_MAX);
+        Ok(accrued)
     }
 
     /// Admin-only: update the minimum deposit amount (in stroops) to respond to
@@ -1738,6 +1749,12 @@ impl EscrowContract {
         transfer.current_admin.require_auth();
         transfer.pending_admin = Some(new_admin.clone());
         env.storage().instance().set(&DataKey::Admin, &transfer);
+        env.storage().instance().set(
+            &DataKey::AdminProposalExpiry,
+            &env.ledger()
+                .timestamp()
+                .saturating_add(ADMIN_PROPOSAL_TTL_SECS),
+        );
         env.events().publish(("admin", "proposed"), new_admin);
         Ok(())
     }
@@ -1753,10 +1770,21 @@ impl EscrowContract {
             .pending_admin
             .clone()
             .ok_or(EscrowError::NoPendingAdmin)?;
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminProposalExpiry)
+            .unwrap_or(0);
+        if env.ledger().timestamp() >= expires_at {
+            return Err(EscrowError::AdminProposalExpired);
+        }
         pending.require_auth();
         transfer.current_admin = pending.clone();
         transfer.pending_admin = None;
         env.storage().instance().set(&DataKey::Admin, &transfer);
+        env.storage()
+            .instance()
+            .remove(&DataKey::AdminProposalExpiry);
         env.events().publish(("admin", "accepted"), pending);
         Ok(())
     }
@@ -1918,11 +1946,16 @@ impl EscrowContract {
         Self::has_escrow_field(env, raw, status_key) && Self::has_escrow_field(env, raw, token_key)
     }
 
-    /// Read-only migration dry-run for operators. Returns one tuple for each
-    /// requested order ID: `(order_id, needs_migration)`. Missing IDs and
-    /// already-v2 escrows return `false`; legacy v1 `EscrowRecord` entries
-    /// return `true`. (#981)
-    pub fn migrate_preview(env: Env, order_ids: Vec<u64>) -> Vec<(u64, bool)> {
+    /// Read-only migration dry-run for at most `MAX_BATCH_MIGRATION` IDs.
+    /// Missing IDs and already-v2 escrows return `false`; legacy v1 records
+    /// return `true`. Larger previews must be split into separate calls. (#981)
+    pub fn migrate_preview(
+        env: Env,
+        order_ids: Vec<u64>,
+    ) -> Result<Vec<(u64, bool)>, EscrowError> {
+        if order_ids.len() > MAX_BATCH_MIGRATION {
+            return Err(EscrowError::BatchTooLarge);
+        }
         let mut preview: Vec<(u64, bool)> = Vec::new(&env);
 
         for order_id in order_ids.iter() {
@@ -1934,7 +1967,7 @@ impl EscrowContract {
             preview.push_back((order_id, needs_migration));
         }
 
-        preview
+        Ok(preview)
     }
 
     pub fn migrate(
@@ -1942,6 +1975,9 @@ impl EscrowContract {
         order_ids: Vec<u64>,
         fallback_token: Address,
     ) -> Result<u32, EscrowError> {
+        if order_ids.len() > MAX_BATCH_MIGRATION {
+            return Err(EscrowError::BatchTooLarge);
+        }
         // Only the current admin may trigger a migration.
         let transfer: AdminTransfer = env
             .storage()
@@ -2277,6 +2313,14 @@ mod test {
     const MAX_BATCH_DEPOSIT_MEMORY_BUDGET: u64 = 2_000_000;
     const MAX_BATCH_RELEASE_CPU_BUDGET: u64 = 12_000_000;
     const MAX_BATCH_RELEASE_MEMORY_BUDGET: u64 = 3_000_000;
+
+    #[contract]
+    struct BatchBudgetRewardToken;
+
+    #[contractimpl]
+    impl BatchBudgetRewardToken {
+        pub fn mint(_env: Env, _to: Address, _amount: i128) {}
+    }
 
     fn store_escrow(env: &Env, order_id: u64, buyer: Address, farmer: Address, token: Address) {
         let escrow = Escrow {
@@ -2683,7 +2727,7 @@ mod test {
             ids.push_back(31);
             ids.push_back(32);
 
-            let preview = EscrowContract::migrate_preview(env, ids);
+            let preview = EscrowContract::migrate_preview(env, ids).unwrap();
             assert_eq!(preview.len(), 3);
             assert_eq!(preview.get(0).unwrap(), (30, true));
             assert_eq!(preview.get(1).unwrap(), (31, false));
@@ -2740,6 +2784,45 @@ mod test {
             entries.push_back((200_u64, buyer, farmer, token, MIN_DEPOSIT_STROOPS, 9999_u64));
             let result = EscrowContract::batch_deposit(env, entries);
             assert_eq!(result, Err(EscrowError::AlreadyExists));
+        });
+    }
+
+    #[test]
+    fn batch_deposit_rejects_mixed_buyers_without_writing_escrows() {
+        let env = Env::default();
+        let contract_id = env.register(EscrowContract, ());
+        env.mock_all_auths();
+        env.clone().as_contract(&contract_id, || {
+            let buyer_a = Address::generate(&env);
+            let buyer_b = Address::generate(&env);
+            let farmer_a = Address::generate(&env);
+            let farmer_b = Address::generate(&env);
+            let token = Address::generate(&env);
+            let timeout = env.ledger().timestamp() + MIN_TIMEOUT_SECS + 1;
+            let mut entries = Vec::new(&env);
+            entries.push_back((
+                300_u64,
+                buyer_a,
+                farmer_a,
+                token.clone(),
+                MIN_DEPOSIT_STROOPS,
+                timeout,
+            ));
+            entries.push_back((
+                301_u64,
+                buyer_b,
+                farmer_b,
+                token,
+                MIN_DEPOSIT_STROOPS,
+                timeout,
+            ));
+
+            assert_eq!(
+                EscrowContract::batch_deposit(env.clone(), entries),
+                Err(EscrowError::InvalidParties)
+            );
+            assert!(!env.storage().persistent().has(&DataKey::Escrow(300)));
+            assert!(!env.storage().persistent().has(&DataKey::Escrow(301)));
         });
     }
 
@@ -3974,13 +4057,20 @@ mod test {
     fn max_batch_deposit_and_release_resource_budget() {
         let env = Env::default();
         let contract_id = env.register(EscrowContract, ());
+        let reward_token = env.register(BatchBudgetRewardToken, ());
         let token = contract_test_utils::register_noop_token(&env);
         env.mock_all_auths();
 
         env.clone().as_contract(&contract_id, || {
             let platform = Address::generate(&env);
+            let cooperative = Address::generate(&env);
+            let buyer = Address::generate(&env);
             env.storage().instance().set(&DataKey::Platform, &platform);
             env.storage().instance().set(&DataKey::FeeBps, &0_u32);
+            env.storage()
+                .instance()
+                .set(&DataKey::RewardTokenContract, &reward_token);
+            env.storage().instance().set(&DataKey::RewardBps, &100_u32);
 
             let mut ids: Vec<u64> = Vec::new(&env);
             let mut entries: Vec<(u64, Address, Address, Address, i128, u64)> = Vec::new(&env);
@@ -3991,12 +4081,11 @@ mod test {
 
             for i in 0..MAX_BATCH_RELEASE {
                 let order_id = 10_000_u64 + u64::from(i);
-                let buyer = Address::generate(&env);
                 let farmer = Address::generate(&env);
                 ids.push_back(order_id);
                 entries.push_back((
                     order_id,
-                    buyer,
+                    buyer.clone(),
                     farmer,
                     token.clone(),
                     MIN_DEPOSIT_STROOPS,
@@ -4021,6 +4110,16 @@ mod test {
 
             for i in 0..MAX_BATCH_RELEASE {
                 let order_id = ids.get(i).unwrap();
+                let mut escrow: Escrow = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::Escrow(order_id))
+                    .unwrap();
+                escrow.cooperative_address = Some(cooperative.clone());
+                escrow.cooperative_royalty_bps = 500;
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::Escrow(order_id), &escrow);
                 assert!(
                     env.storage()
                         .persistent()
@@ -4791,6 +4890,8 @@ mod deposit_path_test {
     const ROYALTY: i128 = 487_500; // 5% of (AMOUNT - FEE)
     const FARMER_NET: i128 = 9_262_500;
     const TIMEOUT: u64 = 100_000;
+    const MAX_STREAM_CPU_BUDGET: u64 = 12_000_000;
+    const MAX_STREAM_MEMORY_BUDGET: u64 = 3_000_000;
 
     struct Fx {
         env: Env,
@@ -4997,9 +5098,20 @@ mod deposit_path_test {
         let reward = fx.use_reward_token();
         fx.deposit(1);
         let end = fx.env.ledger().timestamp() + 1_000;
+        fx.env.budget().reset_tracker();
         let stream_id = fx.client().release_to_stream(&1, &1_000, &end);
+        let stream_cpu = fx.env.budget().cpu_instruction_cost();
+        let stream_mem = fx.env.budget().memory_bytes_cost();
 
         assert_eq!(stream_id, 1);
+        assert!(
+            stream_cpu <= MAX_STREAM_CPU_BUDGET,
+            "release_to_stream CPU budget grew to {stream_cpu}"
+        );
+        assert!(
+            stream_mem <= MAX_STREAM_MEMORY_BUDGET,
+            "release_to_stream memory budget grew to {stream_mem}"
+        );
         assert_eq!(fx.bal(&fx.fee_dest), FEE);
         assert_eq!(fx.bal(&fx.coop), ROYALTY);
         // The farmer's net amount stays in the contract as the stream deposit.

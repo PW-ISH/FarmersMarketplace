@@ -67,7 +67,9 @@ pub fn get_accrued_amount(stream: &PaymentStream, now: u64) -> i128 {
     }
     let effective_now = now.min(stream.end_time);
     let delta = effective_now.saturating_sub(stream.last_checkpoint_at) as i128;
-    let accrued = stream.accrued_at_checkpoint + delta * stream.rate_per_second;
+    let accrued = stream
+        .accrued_at_checkpoint
+        .saturating_add(delta.saturating_mul(stream.rate_per_second));
     accrued.min(stream.deposit)
 }
 
@@ -86,17 +88,32 @@ pub fn checkpoint(mut stream: PaymentStream, now: u64) -> PaymentStream {
 /// If that is less than `remaining_deposit`, the difference is surplus and
 /// should be refunded to the sender immediately.
 pub fn compute_surplus(stream: &PaymentStream, now: u64, new_rate: i128) -> i128 {
+    assert!(new_rate >= 0, "new_rate must be non-negative");
     let accrued = get_accrued_amount(stream, now);
-    let remaining_deposit = stream.deposit - accrued;
+    let remaining_deposit = stream
+        .deposit
+        .checked_sub(accrued)
+        .expect("remaining deposit underflowed i128");
     let remaining_time = stream.end_time.saturating_sub(now) as i128;
-    let consumable = remaining_time
-        .checked_mul(new_rate)
-        .expect("remaining_time * new_rate overflowed i128");
+    let consumable = remaining_time.saturating_mul(new_rate);
     if consumable < remaining_deposit {
         remaining_deposit - consumable
     } else {
         0
     }
+}
+
+fn required_additional_deposit(stream: &PaymentStream, now: u64, new_rate: i128) -> i128 {
+    let accrued = get_accrued_amount(stream, now);
+    let remaining_time = stream.end_time.saturating_sub(now) as i128;
+    let required_total = remaining_time
+        .checked_mul(new_rate)
+        .expect("remaining_time * new_rate overflowed i128");
+    let remaining_deposit = stream
+        .deposit
+        .checked_sub(accrued)
+        .expect("remaining stream deposit underflowed i128");
+    required_total.saturating_sub(remaining_deposit)
 }
 
 // ---------------------------------------------------------------------------
@@ -158,10 +175,16 @@ pub fn decrease_rate_per_second(
     stream.rate_per_second = new_rate;
     // Reduce deposit by surplus (caller is responsible for the actual token
     // transfer; here we only track the accounting).
-    stream.deposit -= surplus;
+    stream.deposit = stream
+        .deposit
+        .checked_sub(surplus)
+        .expect("stream deposit underflowed i128");
 
     // 4. Persist the updated stream.
     env.storage().persistent().set(&key, &stream);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, crate::TTL_MIN, crate::TTL_MAX);
 
     // Return surplus so the caller knows how much to transfer back.
     surplus
@@ -187,7 +210,10 @@ pub fn get_accrued_amount_on_chain(env: &Env, stream_id: u64) -> i128 {
 fn allocate_stream_id(env: &Env) -> u64 {
     let counter_key = soroban_sdk::symbol_short!("nextid");
     let next_id: u64 = env.storage().persistent().get(&counter_key).unwrap_or(1);
-    env.storage().persistent().set(&counter_key, &(next_id + 1));
+    let following_id = next_id.checked_add(1).expect("stream ID overflowed u64");
+    env.storage()
+        .persistent()
+        .set(&counter_key, &following_id);
     next_id
 }
 
@@ -245,6 +271,11 @@ pub fn create_stream(
     env.storage()
         .persistent()
         .set(&StreamKey::Stream(stream_id), &stream);
+    env.storage().persistent().extend_ttl(
+        &StreamKey::Stream(stream_id),
+        crate::TTL_MIN,
+        crate::TTL_MAX,
+    );
 
     // Emit StreamCreated event.
     env.events().publish(
@@ -305,11 +336,17 @@ pub fn withdraw(env: &Env, stream_id: u64, token: &Address, recipient: &Address)
         token_client.transfer(&env.current_contract_address(), recipient, &withdrawable);
 
         // Update withdrawn amount.
-        stream.withdrawn_amount += withdrawable;
+        stream.withdrawn_amount = stream
+            .withdrawn_amount
+            .checked_add(withdrawable)
+            .expect("withdrawn amount overflowed i128");
     }
 
     // Persist updated stream.
     env.storage().persistent().set(&key, &stream);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, crate::TTL_MIN, crate::TTL_MAX);
 
     // Emit Withdrawn event.
     env.events().publish(
@@ -351,13 +388,19 @@ pub fn cancel_stream(env: &Env, stream_id: u64, token: &Address) -> i128 {
     stream = checkpoint(stream, now);
 
     // Compute unaccrued remainder.
-    let unaccrued = stream.deposit - stream.accrued_at_checkpoint;
+    let unaccrued = stream
+        .deposit
+        .checked_sub(stream.accrued_at_checkpoint)
+        .expect("unaccrued amount underflowed i128");
 
     // Mark cancelled.
     stream.cancelled = true;
 
     // Persist updated stream.
     env.storage().persistent().set(&key, &stream);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, crate::TTL_MIN, crate::TTL_MAX);
 
     // Refund unaccrued remainder to sender.
     if unaccrued > 0 {
@@ -423,15 +466,13 @@ pub fn increase_rate_per_second(
     // Checkpoint accrual before touching the rate.
     stream = checkpoint(stream, now);
 
-    // Compute required deposit for the higher rate through end_time.
-    let remaining_time = stream.end_time.saturating_sub(now) as i128;
-    let rate_increase = new_rate - stream.rate_per_second;
-    // Checked to fail cleanly (before any token transfer or storage write
-    // below) rather than risk an unhandled overflow panic partway through
-    // a state-changing call. (#1228)
-    let required_additional = remaining_time
-        .checked_mul(rate_increase)
-        .expect("remaining_time * rate_increase overflowed i128");
+    // Fund the full higher-rate liability through end_time, including any
+    // pre-existing shortfall in the stream's remaining deposit.
+    let required_additional = required_additional_deposit(&stream, now, new_rate);
+    let new_deposit = stream
+        .deposit
+        .checked_add(additional_deposit)
+        .expect("stream deposit overflowed i128");
 
     assert!(
         additional_deposit >= required_additional,
@@ -444,10 +485,13 @@ pub fn increase_rate_per_second(
 
     // Apply the new rate and increase deposit.
     stream.rate_per_second = new_rate;
-    stream.deposit += additional_deposit;
+    stream.deposit = new_deposit;
 
     // Persist the updated stream.
     env.storage().persistent().set(&key, &stream);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, crate::TTL_MIN, crate::TTL_MAX);
 
     // Emit RateIncreased event.
     env.events().publish(
@@ -498,16 +542,23 @@ pub fn top_up(
 
     // Checkpoint the stream.
     stream = checkpoint(stream, now);
+    let new_deposit = stream
+        .deposit
+        .checked_add(additional_deposit)
+        .expect("stream deposit overflowed i128");
 
     // Transfer additional_deposit from sender to contract.
     let token_client = token::Client::new(env, token);
     token_client.transfer(sender, &env.current_contract_address(), &additional_deposit);
 
     // Increase deposit without changing rate.
-    stream.deposit += additional_deposit;
+    stream.deposit = new_deposit;
 
     // Persist the updated stream.
     env.storage().persistent().set(&key, &stream);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, crate::TTL_MIN, crate::TTL_MAX);
 
     // Emit TopUp event.
     env.events().publish(
@@ -570,6 +621,13 @@ mod tests {
         let stream = make_stream(&env, 10, 300, 0, 200);
         // At t=100: 100 * 10 = 1000 > deposit(300), clamped to 300
         assert_eq!(get_accrued_amount(&stream, 100), 300);
+    }
+
+    #[test]
+    fn accrual_overflow_is_capped_at_deposit() {
+        let env = Env::default();
+        let stream = make_stream(&env, i128::MAX, i128::MAX, 0, 2);
+        assert_eq!(get_accrued_amount(&stream, 2), i128::MAX);
     }
 
     #[test]
@@ -1045,12 +1103,20 @@ mod tests {
             last_checkpoint_at: 30,
             end_time: 100,
             cancelled: false,
-            withdrawn_amount: 0,
+            withdrawn_amount: 100,
         };
 
-        // Refund = deposit - accrued = 1000 - 300 = 700
-        let unaccrued = stream.deposit - stream.accrued_at_checkpoint;
-        assert_eq!(unaccrued, 700);
+        // The recipient keeps accrued funds, less prior withdrawals; only the
+        // unaccrued balance is refunded to the sender.
+        let accrued = get_accrued_amount(&stream, 30);
+        let recipient_due = accrued - stream.withdrawn_amount;
+        let sender_refund = stream.deposit - accrued;
+        assert_eq!(recipient_due, 200);
+        assert_eq!(sender_refund, 700);
+        assert_eq!(
+            recipient_due + stream.withdrawn_amount + sender_refund,
+            stream.deposit
+        );
     }
 
     #[test]
@@ -1136,6 +1202,16 @@ mod tests {
         let provided = 400;
 
         assert!(provided < required_additional);
+    }
+
+    #[test]
+    fn increase_rate_covers_existing_underfunding() {
+        let env = Env::default();
+        let stream = make_stream(&env, 10, 500, 0, 100);
+
+        // At t=40, 400 has accrued and only 100 remains, but the new rate
+        // requires 900 through the end time.
+        assert_eq!(required_additional_deposit(&stream, 40, 15), 800);
     }
 
     // ── top_up (issue #972) ───────────────────────────────────────────────────
