@@ -506,13 +506,12 @@ These codes are stable on-chain ABI values. Never reuse a code, even after remov
 | 25 | `InvalidRoyalty` | Cooperative royalty exceeds 10 000 bps (100%) |
 | 26 | `EvidenceLimitReached` | Party already submitted the maximum number of evidence hashes |
 | 27 | `NotDisputed` | Operation requires the escrow to be disputed |
-| 28 | `NotInitialized` | Admin not configured; `initialize` has not been called |
+| 28 | `NotInitialized` | Admin or settlement configuration is missing; call `initialize` first |
+| 29 | `InvalidParties` | Buyer equals farmer, or the cooperative address equals either party |
+| 30 | `InvalidCoopConfig` | Cooperative threshold or member configuration is invalid |
+| 31 | `NotInDispute` | `resolve_dispute` called on an escrow that is not disputed |
 
-Next available code: **29**. See the `NEXT_CODE` comment in `contracts/escrow/src/lib.rs` for the authoritative value.
-| 23 | `NotInitialized` | A stored value settlement depends on (platform fee, fee destination, admin) is missing because `initialize` was never called |
-| 24 | `NotInDispute` | `resolve_dispute` called on an escrow that is not in the `Disputed` state |
-
-Next available code: **25**. See the `NEXT_CODE` comment in `contracts/escrow/src/lib.rs` for the authoritative value.
+Next available code: **32**. See the `NEXT_CODE` comment in `contracts/escrow/src/lib.rs` for the authoritative value.
 
 ### Build & Test
 
@@ -597,3 +596,21 @@ For security vulnerabilities, follow the process in [SECURITY.md](./SECURITY.md)
 
 <!-- handsoff-issue-1382 -->
 - #1382: Align `api/client.js` with real backend routes: about a dozen methods call endpoints that don't exist
+
+<!-- handsoff-issue-1524 -->
+- #1524: CT-05: Multisig payload should bind the action and network, not just `(contract, order_id)`
+
+<!-- handsoff-issue-1540 -->
+- #1540: CT-21: Evidence submission — validate party, window and storage layout
+<!-- handsoff-issue-1525 -->
+- #1525: CT-06: `creator-earnings::claim` lets the caller choose any token, but balances aren't tracked per token
+
+<!-- handsoff-issue-1528 -->
+- #1528: CT-09: Buyer/farmer escrow index stops growing at `MAX_INDEX_ENTRIES` (1,000) — define the behaviour
+<!-- handsoff-issue-1522 -->
+- #1522: CT-03: Truncated and duplicated function signatures: `resolve_dispute`, `set_coop`, `multisig_release`
+<!-- handsoff-issue-1538 -->
+- #1538: CT-19: Rounding policy tests for fees, royalties and rewards
+
+<!-- handsoff-issue-1539 -->
+- #1539: CT-20: Auto-release and timeout refund: define precedence and test the boundaries
