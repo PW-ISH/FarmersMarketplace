@@ -262,6 +262,7 @@ jobs:
           - name: contracts-workspace
             dir: contracts
             sdk: sdk22
+            # test-utils is a workspace member (fmt/clippy/test) but ships no WASM
             wasm: soroban_escrow creator_earnings
           # Legacy SDK =21.x crates, each with its own manifest
           - name: contract-escrow
@@ -311,18 +312,34 @@ jobs:
       - name: Build release WASM
         run: cargo build --target wasm32-unknown-unknown --release
 
-      - name: Collect WASM artifacts
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v22.8.1
+
+      - name: Optimise WASM and enforce 64 KB limit
         run: |
           mkdir -p "$GITHUB_WORKSPACE/wasm-out"
+          : > "$GITHUB_WORKSPACE/wasm-out/sizes-${{ matrix.name }}.tsv"
+          fail=0
           for w in ${{ matrix.wasm }}; do
-            cp "target/wasm32-unknown-unknown/release/$w.wasm" "$GITHUB_WORKSPACE/wasm-out/"
+            src="target/wasm32-unknown-unknown/release/$w.wasm"
+            out="$GITHUB_WORKSPACE/wasm-out/$w.optimized.wasm"
+            stellar contract optimize --wasm "$src" --wasm-out "$out"
+            cp "$src" "$GITHUB_WORKSPACE/wasm-out/"
+            size=$(stat -c%s "$out")
+            printf '%s\t%s\n' "$w" "$size" >> "$GITHUB_WORKSPACE/wasm-out/sizes-${{ matrix.name }}.tsv"
+            if [ "$size" -gt 65536 ]; then
+              echo "::error::$w optimised WASM is $size bytes (> 64 KB limit)"; fail=1
+            fi
           done
+          exit $fail
 
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v4
         with:
           name: wasm-${{ matrix.name }}
-          path: wasm-out/*.wasm
+          path: |
+            wasm-out/*.wasm
+            wasm-out/*.tsv
           retention-days: 30
 
       - name: Check escrow error codes
@@ -343,6 +360,55 @@ jobs:
           fi
           sudo apt-get install -y postgresql-client >/dev/null
           bash contracts/scripts/check-wasm-hashes.sh
+
+  wasm-size-report:
+    name: WASM size diff
+    needs: contracts
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wasm-*
+          path: head
+          merge-multiple: true
+
+      - name: Download baseline sizes from main
+        uses: dawidd6/action-download-artifact@v6
+        continue-on-error: true
+        with:
+          workflow: ci.yml
+          branch: main
+          name: wasm-.*
+          name_is_regexp: true
+          path: base
+          if_no_artifact_found: ignore
+
+      - name: Build size diff table
+        run: |
+          cat head/sizes-*.tsv | sort > head.tsv
+          find base -name 'sizes-*.tsv' -exec cat {} + 2>/dev/null | sort > base.tsv || true
+          {
+            echo '<!-- wasm-size-report -->'
+            echo '### Optimised WASM sizes (limit 64 KB)'
+            echo '| Contract | main | PR | Δ |'
+            echo '|---|---:|---:|---:|'
+            while IFS=$'\t' read -r name size; do
+              b=$(awk -F'\t' -v n="$name" '$1==n{print $2}' base.tsv)
+              if [ -n "$b" ]; then d=$((size - b)); else b='—'; d='new'; fi
+              echo "| \`$name\` | $b | $size | $d |"
+            done < head.tsv
+          } > comment.md
+          cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post or update PR comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: wasm-size-report
+          path: comment.md
 
   contract-tests-nightly:
     name: Contract Tests (nightly, Docker)

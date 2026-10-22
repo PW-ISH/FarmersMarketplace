@@ -43,6 +43,18 @@ pub struct CarbonOffset {
     pub verifier: Address,
 }
 
+/// Contract version reported by `version()`. (CT-28)
+pub const CONTRACT_VERSION: u32 = 1;
+
+/// Read-only snapshot of contract configuration. (CT-28)
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct Config {
+    pub admin: Option<Address>,
+    pub pending_admin: Option<Address>,
+    pub version: u32,
+}
+
 #[contract]
 pub struct CarbonOffsetContract;
 
@@ -293,6 +305,21 @@ impl CarbonOffsetContract {
             );
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         bump_instance(&env);
+    }
+
+    /// Read-only view of the contract configuration. (CT-28)
+    pub fn get_config(env: Env) -> Config {
+        let store = env.storage().instance();
+        Config {
+            admin: store.get(&ADMIN),
+            pending_admin: store.get(&PENDING_ADMIN),
+            version: CONTRACT_VERSION,
+        }
+    }
+
+    /// Contract code version. (CT-28)
+    pub fn version(_env: Env) -> u32 {
+        CONTRACT_VERSION
     }
 }
 
